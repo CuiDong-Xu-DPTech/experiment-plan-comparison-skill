@@ -31,13 +31,20 @@ never converted or cross-summed. item_id must be an identifier; a category gets
 cost_CATEGORY only when it is an identifier. Cost components may use parameters,
 elapsed_hours, person_hours_total and machine_hours_total, but not other costs.
 Task fields use parameters; task hours may additionally use duration_hours.
-Missing hour fields contribute zero; no staffing or speeds are inferred. Hard
-constraints and metrics additionally receive cost_ITEM/category/total values.
-Missing source_ref is an uncertainty. Kahn cycle detection and precedence-only
-earliest starts define elapsed_hours; no slots, resources or parallelism claims.
+Absent optional person/machine fields contribute zero; explicit null is unknown.
+Duration/person/machine hours must be nonnegative (real zero remains valid).
+Hard constraints/metrics also receive cost_ITEM/category/total values. Missing
+source_ref remains an uncertainty. resource_contention_known=true is a case
+declaration that DAG parallelism has no resource contention; otherwise only a
+forced-serial chain yields elapsed_hours. An unproven parallel DAG exposes only a
+precedence lower bound and unknown elapsed_hours. No absolute booking is claimed.
+Empty cost/task sets are complete; incomplete resource ledgers block determinate
+optimization without automatically making evaluated hard constraints infeasible.
 
-Shared priorities give exact lexicographic rank; otherwise Pareto has no unique
-winner. Ties/missing values/unknown scenarios block determinate optimization.
+Shared priorities give exact lexicographic rank; equal priority retains array
+order. Pareto uses only numeric comparisons and never auto-selects a unique winner;
+an Agent may separately justify choosing a singleton front. Ties/missing values/
+unknown scenarios/incomplete resource ledgers block determinate optimization.
 Exit 0 covers completed vacuous/infeasible/undetermined/per-plan-error audits;
 configuration and IO failures emit structured JSON on stderr and exit 2.
 """
@@ -141,13 +148,18 @@ class Parser:
             self.take(); return ("not", self.parse_not())
         return self.parse_compare()
     def parse_compare(self):
-        node, comparisons = self.parse_term(), []
+        node, comparisons = self.parse_additive(), []
         while self.current()[1] in ("<", "<=", ">", ">=", "==", "!="):
-            op = self.take()[1]; comparisons.append((op, self.parse_term()))
+            op = self.take()[1]; comparisons.append((op, self.parse_additive()))
         return ("compare", node, comparisons) if comparisons else node
+    def parse_additive(self):
+        node = self.parse_term()
+        while self.current()[1] in ("+", "-"):
+            op = self.take()[1]; node = (op, node, self.parse_term())
+        return node
     def parse_term(self):
         node = self.parse_unary()
-        while self.current()[1] in ("+", "-", "*", "/"):
+        while self.current()[1] in ("*", "/"):
             op = self.take()[1]; node = (op, node, self.parse_unary())
         return node
     def parse_unary(self):
@@ -315,41 +327,57 @@ def prepare_dag(task_entries):
             if predecessor not in order: raise PlanError("unknown predecessor: " + predecessor)
             edges[predecessor].append(task["task_id"]); indegree[task["task_id"]] += 1
     heap = [(order[task_id], task_id) for task_id, degree in indegree.items() if degree == 0]
-    heapq.heapify(heap); topological = []
+    heapq.heapify(heap); topological = []; parallel_placeholder = len(heap) > 1
     while heap:
         _, task_id = heapq.heappop(heap); topological.append(task_id)
         for successor in edges[task_id]:
             indegree[successor] -= 1
             if indegree[successor] == 0: heapq.heappush(heap, (order[successor], successor))
+        if len(heap) > 1: parallel_placeholder = True
     if len(topological) != len(tasks):
         raise PlanError("schedule cycle involving: " + ", ".join(sorted(t for t, d in indegree.items() if d)))
-    return tasks, topological
+    return tasks, topological, parallel_placeholder
 def schedule_value(prepared, parameters, resource_known):
-    tasks, topological = prepared
+    tasks, topological, parallel_placeholder = prepared
     by_id, ends, rows = {task["task_id"]: task for task in tasks}, {}, []
     for task_id in topological:
         task = by_id[task_id]
         predecessor_ends = [ends[p] for p in task["predecessors"]]
         start = UNKNOWN if any(isinstance(x, Unknown) for x in predecessor_ends) else (max(predecessor_ends) if predecessor_ends else Fraction(0))
         duration, issue = numeric(task["duration_node"], parameters)
+        if isinstance(duration, Fraction) and duration < 0: raise PlanError("negative duration_hours for task " + task_id)
         end = UNKNOWN if isinstance(start, Unknown) or isinstance(duration, Unknown) else start + duration
         ends[task_id] = end
         local = dict(parameters); local["duration_hours"] = duration
         person, person_issue = numeric(task["person_node"], local)
         machine, machine_issue = numeric(task["machine_node"], local)
+        if isinstance(person, Fraction) and person < 0: raise PlanError("negative person_hours for task " + task_id)
+        if isinstance(machine, Fraction) and machine < 0: raise PlanError("negative machine_hours for task " + task_id)
         rows.append({"task_id": task_id, "duration_hours": duration, "earliest_start_hours": start,
                      "earliest_end_hours": end, "person_hours": person, "machine_hours": machine,
                      "issues": [x for x in (issue, person_issue, machine_issue) if x]})
-    elapsed = UNKNOWN if any(isinstance(x, Unknown) for x in ends.values()) else (max(ends.values()) if ends else Fraction(0))
+    precedence_elapsed = UNKNOWN if any(isinstance(x, Unknown) for x in ends.values()) else (max(ends.values()) if ends else Fraction(0))
+    unproven_parallel = parallel_placeholder and not resource_known
+    elapsed = UNKNOWN if unproven_parallel else precedence_elapsed
     def hour_total(key):
         values = [row[key] for row in rows]
         return UNKNOWN if any(isinstance(x, Unknown) for x in values) else sum(values, Fraction(0))
     schedule = {"elapsed_hours": elapsed, "person_hours_total": hour_total("person_hours"),
                 "machine_hours_total": hour_total("machine_hours")}
     public = dict(schedule)
-    public.update({"status": "complete" if not any(isinstance(schedule[k], Unknown) for k in schedule) else "unknown",
-                   "method": "precedence-DAG earliest-start only; no slots or parallelism inferred",
-                   "resource_contention_status": "declared_known_but_not_modeled" if resource_known else "not_proven", "tasks": rows})
+    complete = not any(isinstance(schedule[k], Unknown) for k in schedule)
+    if not tasks:
+        contention, timing = "not_applicable_empty_schedule", "empty task set; elapsed_hours is exactly zero"
+    elif unproven_parallel:
+        contention, timing = "unproven_parallel", "elapsed_hours unknown: DAG parallelism without a no-resource-contention declaration; lower bound is not a hard scheduling guarantee"
+    elif parallel_placeholder:
+        contention, timing = "case_declared_no_contention", "DAG earliest-start makespan allowed by case declaration; not an absolute booking time"
+    else:
+        contention, timing = "not_applicable_forced_serial", "forced-serial precedence chain; known task durations sum exactly, not an absolute booking time"
+    public.update({"status": "complete" if complete else "incomplete", "method": "precedence DAG only; no calendar slots",
+                   "resource_contention_status": contention, "timing_basis": timing,
+                   "parallelism_possible": parallel_placeholder, "precedence_elapsed_lower_bound_hours": precedence_elapsed,
+                   "tasks": rows})
     return schedule, public
 def cost_value(items, base_env):
     env, ledger_items, issues, by_currency, categories = dict(base_env), {}, [], {}, {}
@@ -420,7 +448,9 @@ def _audit_plan(raw, index, maximum):
               "coverage": {"state": "complete", "max_combinations": maximum, "scenario_count": 0,
                            "enumerated_count": 0, "joint_admissible_count": 0, "fully_admissible_count": 0,
                            "infeasible_scenario_count": 0, "undetermined_scenario_count": 0,
-                           "metric_incomplete_scenario_count": 0, "all_scenarios_enumerated": True,
+                           "metric_incomplete_scenario_count": 0, "incomplete_cost_scenario_count": 0,
+                           "incomplete_schedule_scenario_count": 0, "unproven_parallel_scenario_count": 0,
+                           "all_scenarios_enumerated": True,
                            "all_scenarios_fully_admissible": None, "representative_limit": MAX_REPRESENTATIVES,
                            "feasible_representatives_omitted": 0, "undetermined_representatives_omitted": 0,
                            "violations_omitted": 0},
@@ -592,6 +622,10 @@ def _audit_plan(raw, index, maximum):
                 cap_add(result["results"]["undetermined_representatives"], unknown, coverage, "undetermined_representatives_omitted")
                 continue
             coverage["fully_admissible_count"] += 1; metric_values, metric_issues = {}, []
+            if ledger["status"] != "complete": coverage["incomplete_cost_scenario_count"] += 1
+            if schedule_public["status"] != "complete": coverage["incomplete_schedule_scenario_count"] += 1
+            if schedule_public["resource_contention_status"] == "unproven_parallel":
+                coverage["unproven_parallel_scenario_count"] += 1
             for metric in metrics:
                 value, problem = numeric(metric["node"], env); metric_values[metric["metric_id"]] = value
                 if isinstance(value, Unknown):
@@ -622,6 +656,13 @@ def _audit_plan(raw, index, maximum):
     if not coverage["all_scenarios_enumerated"]: blocking.append("enumeration_incomplete")
     if coverage["undetermined_scenario_count"]: blocking.append("undetermined_constraints")
     if coverage["metric_incomplete_scenario_count"]: blocking.append("missing_metric_values")
+    for field, code in (("incomplete_cost_scenario_count", "incomplete_cost_data"),
+                        ("incomplete_schedule_scenario_count", "incomplete_schedule_data"),
+                        ("unproven_parallel_scenario_count", "unproven_parallel_schedule")):
+        if coverage[field]:
+            blocking.append(code)
+            reasons.append({"code": code, "count": coverage[field],
+                            "effect": "status reflects evaluated hard constraints; determinate optimization is blocked"})
     meta["blocked"] = bool(blocking)
     if priorities:
         meta["best_key"] = best_key

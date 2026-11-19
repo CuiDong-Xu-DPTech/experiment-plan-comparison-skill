@@ -18,7 +18,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 TEXT_SUFFIXES = {".txt", ".md", ".json", ".jsonl", ".csv", ".tsv",
                  ".yaml", ".yml", ".xml", ".html", ".htm"}
 EXCLUDED_PARTS = {".git", ".ssh", ".aws", "node_modules", "__pycache__",
@@ -104,6 +104,18 @@ def pdf_backend():
 
 
 def extract_pdf(path, destination, backend):
+    name = backend[0]
+    try:
+        return _extract_pdf(path, destination, backend)
+    except SourceError:
+        raise
+    except Exception as error:
+        detail = str(error)[:500]
+        raise SourceError("PDF extraction failed with %s (%s): %s" % (
+            str(name), type(error).__name__, detail)) from None
+
+
+def _extract_pdf(path, destination, backend):
     name, executable, version = backend
     destination.mkdir(parents=True, exist_ok=True)
     if name == "pdftotext":
@@ -308,7 +320,8 @@ def verify(index_path, claims_path, output_path):
         result["verification"] = "only locator/value equality and byte integrity; evidence relevance and scientific support require review"
         results.append(result)
     report = {"tool_version": VERSION, "verified_at": now(),
-              "all_locators_verified": all(item["locator_verified"] for item in results),
+              "status": "no_claims" if not results else "locator_checks_completed",
+              "all_locators_verified": bool(results) and all(item["locator_verified"] for item in results),
               "claims": results}
     write_json(output_path, report)
     return report

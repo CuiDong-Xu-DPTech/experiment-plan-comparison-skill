@@ -16,7 +16,7 @@ import re
 import sys
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 MISSING = object()
 
 
@@ -205,8 +205,9 @@ def schema_of(contract):
         if "properties" in schema:
             schema.setdefault("type", "object")
             required = schema.get("required")
-            schema["required"] = list(schema["properties"]) if not isinstance(
-                required, list) else required
+            if required is not None and not isinstance(required, list):
+                raise AuditError("schema required must be an array of field names")
+            schema["required"] = list(schema["properties"]) if required is None else required
         return schema
     field_map = contract.get("fields") if isinstance(contract.get("fields"), dict) else contract
     if field_map and all(isinstance(value, dict) for value in field_map.values()):
@@ -217,11 +218,8 @@ def schema_of(contract):
             if "schema" in descriptor and isinstance(descriptor["schema"], dict):
                 properties[name] = descriptor["schema"]
             else:
-                allowed = {"type", "enum", "const", "items", "required",
-                           "properties", "additionalProperties", "default",
-                           "minimum", "maximum", "minItems", "minLength"}
                 properties[name] = {key: value for key, value in descriptor.items()
-                                     if key in allowed}
+                                     if key not in {"name", "field", "key"}}
         return {"type": "object", "properties": properties,
                 "required": list(properties),
                 "additionalProperties": contract.get("additionalProperties", True)}
@@ -345,13 +343,26 @@ def valid_type(value, kind):
                               not isinstance(value, bool) and math.isfinite(value),
             "integer": lambda: ((isinstance(value, int) and not isinstance(value, bool)) or
                                 (isinstance(value, float) and value.is_integer()))}.get(
-                                    kind, lambda: True)()
+                                    kind, lambda: False)()
+
+
+SCHEMA_KEYS = {
+    "$schema", "$id", "$ref", "$defs", "definitions", "$comment",
+    "type", "enum", "const", "properties", "required", "additionalProperties",
+    "items", "minItems", "maxItems", "uniqueItems", "minLength", "maxLength",
+    "pattern", "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
+    "multipleOf", "minProperties", "maxProperties", "anyOf", "oneOf",
+    "allOf", "default", "title", "description", "examples", "nullable"
+}
 
 
 def validation_errors(value, schema, root_schema, path=""):
     errors = []
     if not isinstance(schema, dict):
         return [{"path": path, "message": "schema is not an object"}]
+    unsupported = sorted(set(schema) - SCHEMA_KEYS)
+    if unsupported:
+        return [{"path": path, "message": "unsupported schema keywords; make their semantics explicit before claiming validity: " + ", ".join(unsupported)}]
     if "$ref" in schema:
         try:
             return validation_errors(value, resolve_ref(root_schema, schema["$ref"]),
@@ -369,11 +380,13 @@ def validation_errors(value, schema, root_schema, path=""):
         for branch in schema["allOf"]:
             errors.extend(validation_errors(value, branch, root_schema, path))
     if isinstance(schema.get("type"), list):
+        if not schema["type"] or not all(isinstance(kind, str) for kind in schema["type"]):
+            raise AuditError("schema type array must contain strings")
         if not any(valid_type(value, kind) for kind in schema["type"]):
             errors.append({"path": path, "message": "type does not match " + str(schema["type"])})
             return errors
     elif "type" in schema and not valid_type(value, schema["type"]):
-        errors.append({"path": path, "message": "expected " + schema["type"]})
+        errors.append({"path": path, "message": "expected " + str(schema["type"])})
         return errors
     if schema.get("nullable") is False and value is None:
         errors.append({"path": path, "message": "null is not allowed"})
@@ -382,11 +395,26 @@ def validation_errors(value, schema, root_schema, path=""):
     if "enum" in schema and not any(equal(value, option) for option in schema["enum"]):
         errors.append({"path": path, "message": "value is not in enum"})
     if isinstance(value, dict):
+        for keyword in ("required", "minProperties", "maxProperties"):
+            if keyword == "required" and keyword in schema and (
+                    not isinstance(schema[keyword], list) or
+                    not all(isinstance(name, str) for name in schema[keyword]) or
+                    len(set(schema[keyword])) != len(schema[keyword])):
+                raise AuditError("required must be an array of unique field names")
+            elif keyword != "required" and keyword in schema and (
+                    not isinstance(schema[keyword], int) or isinstance(schema[keyword], bool) or
+                    schema[keyword] < 0):
+                raise AuditError(keyword + " must be a nonnegative integer")
         required = schema.get("required", schema.get("properties", {}).keys())
         for name in required:
             if name not in value:
                 errors.append({"path": path + "/" + str(name).replace("~", "~0").replace("/", "~1"),
                                "message": "required output_contract field is missing"})
+        for keyword in ("minProperties", "maxProperties"):
+            if keyword in schema and (
+                    (keyword == "minProperties" and len(value) < schema[keyword]) or
+                    (keyword == "maxProperties" and len(value) > schema[keyword])):
+                errors.append({"path": path, "message": "object violates " + keyword})
         for key, child in value.items():
             child_path = path + "/" + key.replace("~", "~0").replace("/", "~1")
             if key in schema.get("properties", {}):
@@ -416,6 +444,8 @@ def validation_errors(value, schema, root_schema, path=""):
     if isinstance(value, str):
         if len(value) < schema.get("minLength", 0):
             errors.append({"path": path, "message": "string is shorter than minLength"})
+        if "maxLength" in schema and len(value) > schema["maxLength"]:
+            errors.append({"path": path, "message": "string exceeds maxLength"})
         if "pattern" in schema and not re.search(schema["pattern"], value):
             errors.append({"path": path, "message": "string does not match pattern"})
     if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -423,6 +453,21 @@ def validation_errors(value, schema, root_schema, path=""):
             errors.append({"path": path, "message": "number is below minimum"})
         if "maximum" in schema and value > schema["maximum"]:
             errors.append({"path": path, "message": "number exceeds maximum"})
+        if "exclusiveMinimum" in schema and value <= schema["exclusiveMinimum"]:
+            errors.append({"path": path, "message": "number is below or equal to exclusiveMinimum"})
+        if "exclusiveMaximum" in schema and value >= schema["exclusiveMaximum"]:
+            errors.append({"path": path, "message": "number exceeds or equals exclusiveMaximum"})
+        if "multipleOf" in schema:
+            from decimal import Decimal, InvalidOperation
+            try:
+                factor = Decimal(str(schema["multipleOf"]))
+                if not factor.is_finite() or factor <= 0:
+                    raise AuditError("multipleOf must be a positive finite number")
+                quotient = Decimal(str(value)) / factor
+                if quotient != quotient.to_integral_value():
+                    errors.append({"path": path, "message": "number is not a multipleOf value"})
+            except (InvalidOperation, ZeroDivisionError, ValueError):
+                raise AuditError("multipleOf must be a positive finite number")
     return errors
 
 
@@ -492,15 +537,15 @@ def main(argv=None):
         case = load_json(args.case)
         if not isinstance(case, dict) or "case_id" not in case:
             raise AuditError("input case must be an object with case_id")
-        contract = load_json(args.contract) if args.contract else case.get("output_contract")
-        if args.contract and args.command == "bootstrap":
-            boot_case = dict(case, output_contract=contract)
-        else:
-            boot_case = case
-        fields = field_arguments(json.loads(args.fields_json, object_pairs_hook=unique_object)) \
-            if args.fields_json else None
         result_path = Path(args.result)
         work_dir = Path(args.work_dir)
+        state_path = work_dir / "contract-state.json"
+        if args.command == "bootstrap" and (result_path.exists() or state_path.exists()):
+            raise AuditError("existing result or state: bootstrap refuses overwrite; read the existing checkpoint, patch it, or use fresh result/work paths")
+        contract = load_json(args.contract) if args.contract else case.get("output_contract")
+        boot_case = dict(case, output_contract=contract) if args.contract else case
+        fields = field_arguments(json.loads(args.fields_json, object_pairs_hook=unique_object)) \
+            if args.fields_json else None
         if args.command == "bootstrap":
             result = make_bootstrap(boot_case, fields)
             report = validate_result(boot_case, result, fields)
@@ -508,29 +553,46 @@ def main(argv=None):
                      "case_path": str(Path(args.case).resolve()), "case_sha256": digest(args.case),
                      "case_id": case["case_id"], "created_at": utc_now(), "changes": [],
                      "bootstrap_mechanically_valid": report["valid"], "bootstrap_errors": report["errors"]}
+            if args.contract:
+                state.update(contract_path=str(Path(args.contract).resolve()),
+                             contract_sha256=digest(args.contract))
             atomic_json(result_path, result)
-            atomic_json(work_dir / "contract-state.json", state)
+            atomic_json(state_path, state)
             atomic_json(work_dir / "validation.json", report)
-            print(json.dumps({"result": str(result_path), "state": str(work_dir / "contract-state.json"),
+            print(json.dumps({"result": str(result_path), "state": str(state_path),
                               "mechanically_valid": report["valid"],
                               "errors": report["errors"]}, ensure_ascii=False, indent=2))
             return 0
+        state = load_json(state_path) if state_path.is_file() else None
+        if state is not None:
+            if state.get("case_sha256") != digest(args.case):
+                raise AuditError("case input changed since bootstrap; refusing to mix versions")
+            saved_contract = state.get("contract_path")
+            if args.contract:
+                if str(Path(args.contract).resolve()) != saved_contract or \
+                        digest(args.contract) != state.get("contract_sha256"):
+                    raise AuditError("external contract differs from bootstrap; use fresh work/result paths")
+            elif "output_contract" not in case and saved_contract:
+                if digest(saved_contract) != state.get("contract_sha256"):
+                    raise AuditError("saved external contract changed; refusing to mix versions")
+                contract = load_json(saved_contract)
         result = load_json(args.result)
-        validate_case = dict(case, output_contract=contract) if args.contract else case
+        validate_case = dict(case, output_contract=contract) if contract is not None else case
         if args.command == "validate":
             report = validate_result(validate_case, result, fields)
             atomic_json(work_dir / "validation.json", report)
             print(json.dumps(report, ensure_ascii=False, indent=2))
             return 0 if report["valid"] else 1
-        state = load_json(work_dir / "contract-state.json")
-        if state.get("case_sha256") != digest(args.case):
-            raise AuditError("case input changed since bootstrap; refusing to mix versions")
+        if state is None:
+            raise AuditError("patch requires the checkpoint from bootstrap in --work-dir")
         patch_document = load_json(args.patch)
         metadata = {}
         if isinstance(patch_document, dict):
             metadata = {key: patch_document[key] for key in ("reason", "source_refs")
                         if key in patch_document}
             patch_document = patch_document.get("patch")
+        if not isinstance(patch_document, list):
+            raise AuditError("patch must be a JSON array or an object containing a patch array")
         if "case_id" in result:
             for operation in patch_document:
                 if isinstance(operation, dict) and operation.get("path") == "/case_id" and \
@@ -556,13 +618,13 @@ def main(argv=None):
                 [part.strip() for part in args.source_refs.split(",") if part.strip()]),
             "patch": patch_document, "before_result_sha256": before_hash,
             "after_result_sha256": after_hash})
-        atomic_json(work_dir / "contract-state.json", state)
+        atomic_json(state_path, state)
         atomic_json(work_dir / "validation.json", report)
         print(json.dumps({"result": str(result_path), "valid": True,
                           "change_count": len(state["changes"]), "warnings": report["warnings"]},
                          ensure_ascii=False, indent=2))
         return 0
-    except (AuditError, OSError, json.JSONDecodeError) as error:
+    except (AuditError, OSError, json.JSONDecodeError, TypeError, re.error) as error:
         print(json.dumps({"valid": False, "error": str(error)}, ensure_ascii=False), file=sys.stderr)
         return 2
 

@@ -24,11 +24,11 @@
 ```bash
 python3 --version
 mkdir -p /app/work /app/output
-python3 /skills/weekly-skill/scripts/source_audit.py index \
-  --root /input --work-dir /app/work
 python3 /skills/weekly-skill/scripts/contract_audit.py bootstrap \
   --case /input/case.json --result /app/output/result.json \
   --work-dir /app/work
+python3 /skills/weekly-skill/scripts/source_audit.py index \
+  --root /input --work-dir /app/work
 ```
 
 如果原 `task.md` 而非 `case.json` 定义了字段，先将原字段忠实转录为 JSON 或 JSON Schema，再传：
@@ -38,6 +38,12 @@ python3 /skills/weekly-skill/scripts/contract_audit.py bootstrap \
   --case /input/case.json --contract /app/work/contract.json \
   --result /app/output/result.json --work-dir /app/work
 ```
+
+使用外部 contract 时，后续的 `patch` 与 `validate` 也应传**同一** `--contract /app/work/contract.json`。脚本会保存其路径和 SHA-256；未再次指定时从原 bootstrap 状态恢复同一契约，改变契约必须使用新的结果与工作目录。
+
+`bootstrap` 只能创建新的结果/状态，检测到已有结果或 checkpoint 时默认拒绝覆盖。恢复运行时先读已有结果继续修订，或另选全新的结果/工作路径，不用再次初始化清空先前工作。
+
+契约校验器支持其上所述字段与常见 JSON Schema 约束（类型、必填、枚举、常量、数组/对象数量、字符串长度/模式、数值边界及选择分支）；遇到未支持的 Schema 关键词会明确报错而非静默判绿。它不替代完整官方 Schema 引擎，也不验证科学正确性。
 
 若材料在评测环境之外，将三个参数 `--root`、`--case` 和 `--result` 换成真实路径；不保留开发机绝对路径。用 `python3 脚本 --help` 查看全部开关。
 
