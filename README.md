@@ -8,10 +8,12 @@
 - `references/methods.md`：七类实验字段、证据、成本/排期和版本语义。
 - `references/review-template.md`：可复用的统一审查骨架（不是案例答案）。
 - `references/recovery.md`：缺料、不可读、冲突、无合格候选和契约异常的恢复方式。
+- `references/numeric-input-guide.md`：数值输入格式、受限 `ceil/floor/min/max` 表达式、状态与快速调用指南。
 - `examples.md`：明确标为合成示例的输入、命令与示意输出。
-- `scripts/source_audit.py`：文件索引/哈希、PDF 页文本提取和精确证据定位验证。
-- `scripts/contract_audit.py`：动态原始 `output_contract` 骨架、原子 JSON Patch、变更记录、契约与 `case_id` 验证。
+- `scripts/source_audit.py`：文件索引/哈希、PDF 页文本提取、精确证据定位验证，以及按显式 JSON Pointer 把原字段转为可核的 replace patch（`project`）；不代替科学语义判断或目标结构推断。
+- `scripts/contract_audit.py`：动态原始 `output_contract` 骨架、原子 JSON Patch、变更记录、契约与 `case_id` 验证。`validate --format brief` 只压缩终端显示；`validation.json` 仍含完整报告与待人工满足的说明性要求。
 - `scripts/numeric_audit.py`：精确有理数算术、有限域联合检查、成本/任务图审计、硬门及显式目标比较。
+- `scripts/summary_audit.py`：压缩受存管数值报告，保留原报告 SHA、候选身份/版本、硬门失败、未知、阻塞和覆盖状态。
 
 所有脚本均为 UTF-8 文本，无符号链接或预提取论文/预置案例答案。没有网络数据、个人文件、隐蔽环境变量或手工操作依赖。
 
@@ -43,7 +45,7 @@ python3 /skills/weekly-skill/scripts/contract_audit.py bootstrap \
 
 `bootstrap` 只能创建新的结果/状态，检测到已有结果或 checkpoint 时默认拒绝覆盖。恢复运行时先读已有结果继续修订，或另选全新的结果/工作路径，不用再次初始化清空先前工作。
 
-契约校验器支持其上所述字段与常见 JSON Schema 约束（类型、必填、枚举、常量、数组/对象数量、字符串长度/模式、数值边界及选择分支）；遇到未支持的 Schema 关键词会明确报错而非静默判绿。它不替代完整官方 Schema 引擎，也不验证科学正确性。
+契约校验器支持其上所述字段与常见 JSON Schema 约束（类型、必填、枚举、常量、数组/对象数量、字符串长度/模式、数值边界及选择分支）。除 README 所列别名外，字段 descriptor 的 `must_equal` 按原值映射到 `const`，与已有 `const` 不同则报错；`rule` 原文保留在语义覆盖报告中，不转成布尔约束，仍须人工或领域评审核验。遇到未支持的 Schema 关键词会明确报错而非静默判绿。它不替代完整官方 Schema 引擎，也不验证科学正确性。
 
 若材料在评测环境之外，将三个参数 `--root`、`--case` 和 `--result` 换成真实路径；不保留开发机绝对路径。用 `python3 脚本 --help` 查看全部开关。
 
@@ -75,8 +77,11 @@ PDF 处理按顺序发现本机 `pdftotext`、已安装 `pypdf` 或已安装 `Py
 可在 `/app/work` 或契约允许的位置保存：
 
 - `source-index.json`：实际材料登记和工具版本。
+- `projection.json`：按明确映射生成的 replace patch 与源文件哈希，供 `contract_audit.py patch` 使用；`sources` 留作溯源，不额外注入结果的根字段。
 - `evidence-verification.json`：逐项定位/值相等与哈希验证；不等于证据强度判断。
 - `numeric-input.json`、`numeric-report.json`：规范审查数据及计算覆盖/警告。
+- `numeric-summary.json`：数值报告的紧凑摘要；仍须回看决策相关原文和报告明细，而不把它当科学验证。
+- `normalized_contract.json`、`semantic-coverage.json`：规范化契约及尚未机械验证的说明性要求；不把转换别名或映射自由文本当作已证明其科学含义。
 - `contract-state.json`：实际增量变更及前后结果哈希。
 - `validation.json`：机械字段/Schema 校验结果；不等于科学有效性。
 

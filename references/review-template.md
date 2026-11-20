@@ -119,9 +119,49 @@ source-index 能验证字节和定位，Agent 另外填写：
 
 ## E. 数字输入生成纪律
 
-`numeric-input.json` 的结构支持集合、公式、真实费用行、硬约束和软目标。从读得的原始语义映射到这一结构；精确输入字段以 `scripts/numeric_audit.py` 顶部说明和 `--help` 为准。
+`numeric-input.json` 的结构支持集合、公式、真实费用行、硬约束和软目标。从读得的原始语义映射到这一结构；先读 `references/numeric-input-guide.md` 了解输入格式、受限表达式和摘要，不先用长解析器源码代替问题核查。`--help` 仅用于确认命令参数。
 
 - 只填来源支持的值；不能代入课程标准价、概率、设备产能或经验时长。
 - 在默认先做基础审查的情况下，若明确要求优化，优化值仍属于允许域内建议，必须与原始输入分开。
 - 不能用自然语言绕过算术；用脚本支持的安全表达式、精确十进制值和实际单位。
-- 输入无真实软目标/优先级时，不要求脚本创造单选；科学证据的定性比较另外说明。
+- 输入无真实软目标/优先级时，不要求脚本创造单选；科学证据的定性比较另外说明。若选择只对缩小的目标成立，写明实际范围、被牺牲的终点及 programme/scientific owner 的待确认范围认可，不称原完整目标的最佳方案。
+
+## F. 原始字段投影，减少重复抄写
+
+用于已经核实语义、目标和结构的原始事实，而不是让工具替 Agent 理解异构案例或生成结论。`map.json` 是数组，每项含目标结果路径与原始案例 JSON Pointer；源/目标名称必须人工对应，工具不猜别名：
+
+```json
+[
+  {
+    "result_path": "/<原契约初始化后实际存在的字段>",
+    "source_pointer": "/<原始案例中实际存在的 JSON Pointer>",
+    "select": ["<可选：同构且必需的源字段名>"]
+  }
+]
+```
+
+调用：
+
+```bash
+python3 "$SKILL_DIR/scripts/source_audit.py" project \
+  --case /input/case.json \
+  --map /app/work/projection-map.json \
+  --output /app/work/projection.json
+python3 "$SKILL_DIR/scripts/contract_audit.py" patch \
+  --case /input/case.json --result /app/output/result.json \
+  --work-dir /app/work --patch /app/work/projection.json \
+  --reason "只复用已核实的原始事实" --source-refs <实际来源ID>
+```
+
+- `select` 省略时复制整个源值；若提供，遇到每个 dict 都必须有选中的所有 keys。它不适合未明确嵌套同构关系的混合结构，缺失时明确失败，不用 `null` 或空对象掩盖。
+- `result_path` 不能为空，且只能得到已在 `result.json` 中存在的位置，因为输出只含 `replace`，不注入根 `case_id`、根额外字段或其它源元数据。`sources` 仅留在投影文件中，不进入被 patch 的字段值。
+- false/0/null 保持原类型和值；未知保持未知。复制经费、任务、原始对照或能力数值，不证明它们是实际报价、真实预约、已满足硬门或科学有效。
+- `select` 非源字段名与目标字段名之间的语义映射，不改变科学类别、计量单位或候选版本。必须覆盖任务要求的真实行，不能仅为减少篇幅删除 QC、固定费或源冲突。
+- 后接 `contract_audit.py patch` 验证与变更记录；如果目标路径、契约类型或完整性检查失败，保留原 checkpoint，不能假装源投影已交付。最后的人类/Agent 科学比较、选择、风险与未知审查不能由复制代替。
+
+## G. 实质内容、验收与时间完整性
+
+- 对每个真实候选/组合，逐项检查假设、变量、对照、步骤、参数、资源和判读标准。空数组/空对象须给出有依据的 `not_applicable` 或 `unknown` 原因、影响和待确认内容；真正未修改可明确标 N/A，真实零事件要保留零及单位，不可把空栏算作完成。条件选择仍须每一落选者的具体差别。
+- 校准点、供应商/仪器接受范围、LOD/LOQ、纯度、采集及判无效规则按原始数值、单位和适用条件列出；采用条件写法时连同停止/复核/返工诱因。不能把“校准系列存在”当已放行、未验证 LOD 当阴性零结果，也不能擅自删除界外样本。
+- 队列资格、工作日切换、READ、REPORT、真实 slot/班次和审批是完成路径的组成。不能把拿到 queue eligibility 的日子当完整最早完成日；要有剩余时长以及实际可开始时刻，未经确认则保留条件，而非伪报最早完工。
+- 期限、价格、硬门、校准与 QC 的 case JSON locator 也要按真实路径和 expected value；不可凭印象写出一个更短或错误的父路径。科学短引文必须逐字一致；转述不冒充 exact quote。结构合法、字符串相等和哈希只用于定位/完整性，不自动证明相关性、科学有效或实际执行批准。

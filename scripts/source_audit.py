@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""Index actual local sources and verify evidence locators.
+"""Index sources, verify evidence locators, and project source-linked JSON Patches.
 
 No text, extracted page, scientific fact, or answer is bundled with this tool.
 PDF extraction uses an available listed parser/tool; OCR/rendering is only
 claimed after the agent performs it with resources supplied by the environment.
 """
 import argparse
+import copy
 import datetime
 import hashlib
 import importlib.metadata
 import importlib.util
 import json
+import math
 import os
 import re
 import shutil
@@ -18,7 +20,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 TEXT_SUFFIXES = {".txt", ".md", ".json", ".jsonl", ".csv", ".tsv",
                  ".yaml", ".yml", ".xml", ".html", ".htm"}
 EXCLUDED_PARTS = {".git", ".ssh", ".aws", "node_modules", "__pycache__",
@@ -47,9 +49,16 @@ def unique_object(pairs):
 def load_json(path):
     def reject(value):
         raise SourceError("non-finite JSON number: " + value)
+
+    def finite(value):
+        number = float(value)
+        if not math.isfinite(number):
+            raise SourceError("non-finite JSON number: " + value)
+        return number
+
     with open(path, encoding="utf-8") as handle:
         return json.load(handle, object_pairs_hook=unique_object,
-                         parse_constant=reject)
+                         parse_constant=reject, parse_float=finite)
 
 
 def write_json(path, value):
@@ -60,6 +69,21 @@ def write_json(path, value):
         json.dump(value, handle, ensure_ascii=False, indent=2, allow_nan=False)
         handle.write("\n")
     os.replace(str(temp), str(path))
+
+
+def write_new_json(path, value):
+    data = (json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    created = False
+    try:
+        with open(path, "xb") as handle:
+            created = True
+            handle.write(data)
+    except OSError:
+        if created:
+            path.unlink()
+        raise
 
 
 def sha256(path):
@@ -163,10 +187,9 @@ def parse_pointer(pointer):
         raise SourceError("invalid JSON Pointer: " + str(pointer))
     result = []
     for part in pointer[1:].split("/"):
-        part = part.replace("~1", "/").replace("~0", "~")
-        if "~" in part:
+        if re.search(r"~(?![01])", part):
             raise SourceError("invalid JSON Pointer escape in: " + pointer)
-        result.append(part)
+        result.append(part.replace("~1", "/").replace("~0", "~"))
     return result
 
 
@@ -327,6 +350,65 @@ def verify(index_path, claims_path, output_path):
     return report
 
 
+def select_keys(value, keys):
+    if isinstance(value, dict):
+        missing = [key for key in keys if key not in value]
+        if missing:
+            raise SourceError("select key missing from an encountered object: " +
+                              ", ".join(repr(key) for key in missing))
+        return {key: select_keys(value[key], keys) for key in keys}
+    if isinstance(value, list):
+        return [select_keys(item, keys) for item in value]
+    return copy.deepcopy(value)
+
+
+def project(case_path, map_path, output_path):
+    output_path = Path(output_path)
+    if output_path.exists():
+        raise SourceError("output already exists: " + str(output_path))
+    case = load_json(case_path)
+    requests = load_json(map_path)
+    if not isinstance(requests, list):
+        raise SourceError("projection map must be a JSON array")
+    patch = []
+    sources = []
+    source_path = str(Path(case_path).resolve())
+    source_hash = sha256(case_path)
+    for index, request in enumerate(requests):
+        prefix = "map[" + str(index) + "]: "
+        if not isinstance(request, dict):
+            raise SourceError(prefix + "entry must be an object")
+        unknown = set(request) - {"result_path", "source_pointer", "select"}
+        if unknown:
+            raise SourceError(prefix + "unsupported keys: " + ", ".join(sorted(unknown)))
+        if "result_path" not in request or "source_pointer" not in request:
+            raise SourceError(prefix + "result_path and source_pointer are required")
+        result_path = request["result_path"]
+        source_pointer = request["source_pointer"]
+        if not isinstance(result_path, str) or not result_path.startswith("/"):
+            raise SourceError(prefix + "result_path must be a non-empty RFC6901 JSON Pointer")
+        if parse_pointer(result_path)[0] == "case_id":
+            raise SourceError(prefix + "case_id is immutable")
+        if not isinstance(source_pointer, str):
+            raise SourceError(prefix + "source_pointer must be an RFC6901 JSON Pointer")
+        source_value = json_at(case, source_pointer)
+        if "select" in request:
+            keys = request["select"]
+            if not isinstance(keys, list) or any(not isinstance(key, str) for key in keys):
+                raise SourceError(prefix + "select must be an array of strings")
+            value = select_keys(source_value, keys)
+        else:
+            keys = None
+            value = copy.deepcopy(source_value)
+        patch.append({"op": "replace", "path": result_path, "value": value})
+        sources.append({"source_pointer": source_pointer, "result_path": result_path,
+                        "select": copy.deepcopy(keys), "source_path": source_path,
+                        "sha256": source_hash})
+    report = {"schema_version": "source-projection/v1", "patch": patch, "sources": sources}
+    write_new_json(output_path, report)
+    return {"source_count": len(patch)}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -340,6 +422,10 @@ def main(argv=None):
     verify_parser.add_argument("--index", required=True)
     verify_parser.add_argument("--claims", required=True)
     verify_parser.add_argument("--output", required=True)
+    project_parser = sub.add_parser("project")
+    project_parser.add_argument("--case", required=True)
+    project_parser.add_argument("--map", required=True)
+    project_parser.add_argument("--output", required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "index":
@@ -347,13 +433,15 @@ def main(argv=None):
                 raise SourceError("resource limits must be positive")
             report = create_index(args.root, args.work_dir, args.max_files,
                                   args.max_text_bytes, args.max_pdf_bytes)
+        elif args.command == "project":
+            report = project(args.case, args.map, args.output)
         else:
             report = verify(args.index, args.claims, args.output)
         print(json.dumps({"status": "tool_completed", "records": report.get("source_count", len(report.get("claims", []))),
                           "truncated": report.get("file_selection_truncated"),
                           "all_locators_verified": report.get("all_locators_verified")},
                          ensure_ascii=False, indent=2))
-        return 0 if args.command == "index" or report["all_locators_verified"] else 1
+        return 0 if args.command in ("index", "project") or report["all_locators_verified"] else 1
     except (SourceError, OSError, json.JSONDecodeError) as error:
         print(json.dumps({"status": "tool_error", "error": str(error)}, ensure_ascii=False), file=sys.stderr)
         return 2

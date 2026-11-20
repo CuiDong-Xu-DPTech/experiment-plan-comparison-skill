@@ -21,6 +21,8 @@
 | 三个候选均缺关键证据 | 运行可达完成但有未决，选择无法确认 | 列完整范围内检索和证据缺口 | 写成全部不可行、或强行多数投票 |
 | 依赖任务成环/超预约容量 | `invalid`/`infeasible`，列具体任务 | 保持任务关系并求变更任务图/窗口 | 擅自打破依赖、重叠占用单个设备 |
 | 任务/资源时长缺失 | `unknown` | 有依据的工序工期另算 | 默认小时/工作日、日历工期或到货日期 |
+| 单次 session 超过每日/班次上限 | `infeasible`（对于相应原版本日程） | 保留原值与硬门失败；若允许改版则另算拆班、等待、人工和费用 | 用总机时/人时余量抵消，或擅自拆班后仍称原版本可行 |
+| 日历、班次、后续审查或预约未完整建模 | `undetermined`/具体未决项 | 把机械可行限定为已编码检查，保留原候选其他内容 | 用数值摘要的总状态代替完整实际可行性 |
 | 某脚本语法/IO/类型错误 | `tool_error` 或 `invalid_input`，视影响部分/失败 | 修正输入引用；失败报告不丢候选的其他字段 | 把工具报错当科学不可行，或反复盲目执行 |
 | 时间/请求将耗尽 | `partial` + 未完成字段清单 | 保留最后一个可验证结果并停扩展 | 最后瞬间生成没有依据补齐的大段结果 |
 | 某条目与研究目标确实无关 | `not_applicable` + 依据 | 节省成本，保留理由 | 与未说明或失败混淆 |
@@ -38,7 +40,9 @@
 
 - `output_contract` 不在 case 中时，把实际任务描述准确转录为 `/app/work/contract.json`，给 `bootstrap/validate/patch` 显式传**同一个** `--contract`；原始任务与转录之间不确定的地方另记。bootstrap 状态会保存外部契约的路径与哈希，并在后续命令中恢复它；发现契约变化时拒绝混用，另用新工作/输出路径重新初始化。
 - `bootstrap` 只能用于新建结果和状态。若已经存在结果或 checkpoint，先读取并继续增量修订，或另选全新工作/输出路径；重复初始化会拒绝覆盖，绝不以重置方式丢掉已有结果。
-- 如果脚本不支持该契约表述，不硬套固定验证 Schema。使用脚本支持的 JSON Schema/字段说明映射，保留原始键名和结构；映射解释与问题写入运行记录。不支持的 Schema 关键词必须明确说明，不能在未校验它们的语义后宣告全通过。
+- `contract_audit.py` 保留规范 JSON Schema；对描述式契约只做明确映射：`required_fields`→`required`、`fields`/`top_level_fields`→`properties`、`allowed_values` 或字段 descriptor 中的 `allowed`→`enum`、`required_exact_value`/`must_equal`→`const`，根级 `additional_top_level_fields_allowed`/`additional_top_level_fields`→`additionalProperties`。字段 descriptor 的布尔 `required` 仅决定根级 required 成员，`false` 对应的 optional 字段仍保留在 properties；它与规范 required 数组冲突时拒绝处理。已有规范键与别名冲突时拒绝处理；`nullable` 和类型数组原样保留。转换、原文哈希及规范 Schema 记录于 state/validation，并写入工作目录的 `normalized_contract.json`。
+- `note`、`rule`、`constraint`、`required_content`、`required_content_when_nonnull` 及 `field_requirements` 的自由说明字符串按原 JSON Pointer 保存在 `semantic-coverage.json` 和校验元数据中；wrapper 的 `format`、`required_path`、`result_file` 也仅记为元数据。不得从自由说明猜测 enum、const 或首个允许值；没有机器可读的 allowed/enum 或类型时，bootstrap 使用 `null`/unknown 占位并给出警告。上述内容**没有**被脚本自动判定完成，机械通过不代表科学验收。其它未识别关键词不会被静默忽略；如果脚本不支持该契约表述，不硬套固定验证 Schema，必须明确报告未校验语义。
+- `validate` 默认及 `--format full` 保持完整 stdout；`--format brief` 只精简 stdout，仍执行完整校验并保留全部 errors/warnings、未机械验证语义数量及可用哈希/实际报告路径。完整报告始终写入同一工作目录的 `validation.json`，正常生成的 `normalized_contract.json`、`semantic-coverage.json` 不删减；brief 不是语义或科学通过。
 - `bootstrap` 对必需数值、非空枚举没有诚实默认时会报错。不要改成 0 或随意选一；依据实际输入生成最小合法结构，记入变更记录，再继续审查。
 - `patch` 校验失败时不覆盖上一结果，null/非数组补丁会以结构化错误拒绝。只修正失败操作，检查 JSON Pointer 层级和类型。`/case_id` 不能覆盖，输入哈希变了不能混用变更。
 - 如果原始 Schema 的根对象禁止附加字段却缺少必需 `case_id`，不要私加字段造成“看似通过”。记录契约冲突并把身份写入原合同指定的位置或诚实的侧车，明确未完成项。

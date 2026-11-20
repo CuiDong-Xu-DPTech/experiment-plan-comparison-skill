@@ -14,12 +14,12 @@ resource_contention_known}. Metric: {metric_id, expr, direction}. Preference:
 {priorities:[{metric_id, priority, direction}]}. Numbers are JSON numbers,
 decimal strings, or expression strings; explicit null components are unknown.
 
-Expressions permit decimal/scientific literals, names, True/False, + - * /,
-< <= > >= == !=, and/or/not, unary +/- and parentheses. Chained comparisons and
-parenthesized tuples (equality only) are supported. Calls, attributes, indexing,
-other containers, exponentiation and unknown names are forbidden. No eval/exec
-or binary float: numeric source spans become Decimal then exact Fraction.
-Boolean logic is three-valued and short-circuiting; bool differs from numbers.
+Expressions permit exact decimals, names, arithmetic, comparisons, boolean logic,
+parentheses, tuple equality, ceil(x)/floor(x), and min/max with 2-8 arguments;
+nested calls are <=16 and text <=4000. Other calls/kwargs/splats/attributes/
+indexing/containers/unknown names/exponentiation are rejected; no general calls, eval/exec or binary floats: Decimal becomes exact Fraction. UNKNOWN args stay
+unknown; nonnumeric args are scenario-unknown. No inferred units/calendars/magic
+ratios. Short-circuit three-valued logic and bool-number distinction remain.
 Domain values are intersected with every allowed_domains set. Exhaustive product
 enumeration checks joint/hard constraints and schedule; exceeding the limit is
 undetermined with zero sampling, never silent truncation. Reports retain at most
@@ -53,9 +53,10 @@ from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 SCHEMA = "numeric-audit/v1"
 MAX_REPRESENTATIVES = 20
-NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+NAME_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
 NUMBER_RE = re.compile(r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
 RESERVED = {"cost_total", "elapsed_hours", "person_hours_total", "machine_hours_total"}
+FUNCTION_ARITY = {"ceil": (1, 1), "floor": (1, 1), "min": (2, 8), "max": (2, 8)}
 class ConfigError(Exception): pass
 class PlanError(Exception): pass
 class ValueProblem(Exception): pass
@@ -119,7 +120,7 @@ def tokens(source):
     result.append(("end", "", ""))
     return result
 class Parser:
-    def __init__(self, source): self.source, self.tokens, self.pos = source, tokens(source), 0
+    def __init__(self, source): self.source, self.tokens, self.pos, self.call_depth = source, tokens(source), 0, 0
     def current(self): return self.tokens[self.pos]
     def take(self, spelling=None):
         token = self.current()
@@ -171,6 +172,21 @@ class Parser:
         if kind == "name":
             if spelling in ("True", "False"): return ("literal", spelling == "True")
             if spelling in ("and", "or", "not"): raise PlanError("misplaced boolean operator in %r" % self.source)
+            if self.current()[1] == "(":
+                if spelling not in FUNCTION_ARITY: raise PlanError("unsupported function call: " + spelling)
+                self.take(); self.call_depth += 1
+                if self.call_depth > 16: raise PlanError("function nesting depth exceeds tool limit 16")
+                args = []
+                if self.current()[1] != ")":
+                    while True:
+                        args.append(self.parse_or())
+                        if self.current()[1] != ",": break
+                        self.take()
+                        if self.current()[1] == ")": raise PlanError("trailing comma is not supported in tool function calls")
+                self.take(")"); self.call_depth -= 1
+                low, high = FUNCTION_ARITY[spelling]
+                if not low <= len(args) <= high: raise PlanError("wrong arity for tool function %s: expected %d..%d, got %d" % (spelling, low, high, len(args)))
+                return ("call", spelling, args)
             return ("name", spelling)
         if spelling == "(":
             if self.current()[1] == ")": self.take(); return ("tuple", [])
@@ -186,6 +202,7 @@ class Parser:
         raise PlanError("expected operand, got %r in %r" % (spelling, self.source))
 def node_for(value):
     if isinstance(value, str):
+        if len(value) > 4000: raise PlanError("expression length exceeds tool limit 4000")
         if value not in EXPR_CACHE: EXPR_CACHE[value] = Parser(value).parse()
         return EXPR_CACHE[value]
     if value is None: return ("literal", UNKNOWN)
@@ -227,6 +244,14 @@ def evaluate_node(node, env):
         if node[1] not in env: raise PlanError("unknown expression name: " + node[1])
         return env[node[1]]
     if kind == "tuple": return tuple(evaluate_node(child, env) for child in node[1])
+    if kind == "call":
+        values = [evaluate_node(child, env) for child in node[2]]; value = values[0]
+        if any(isinstance(value, Unknown) for value in values): return UNKNOWN
+        if any(not isinstance(value, Fraction) for value in values):
+            raise ValueProblem(node[1] + " arguments must be numeric and mutually comparable; bool and tuples are unsupported")
+        if node[1] in ("ceil", "floor"):
+            return Fraction(value.numerator // value.denominator if node[1] == "floor" else -((-value.numerator) // value.denominator))
+        return min(values) if node[1] == "min" else max(values)
     if kind in ("+u", "-u"):
         value = evaluate_node(node[1], env)
         if isinstance(value, Unknown): return UNKNOWN
@@ -296,14 +321,18 @@ def listing(owner, key):
     if not isinstance(value, list): raise PlanError(key + " must be an array")
     return value
 def valid_name(value, label):
-    if not isinstance(value, str) or not NAME_RE.match(value): raise PlanError(label + " must be a valid identifier")
+    if not isinstance(value, str) or not NAME_RE.match(value):
+        raise PlanError(label + " must match ASCII [A-Za-z_][A-Za-z0-9_]*; got " + repr(value)[:160])
     return value
 def unique_id(value, seen, label):
     if not isinstance(value, str) or not value or value in seen: raise PlanError("missing or duplicate " + label)
     seen.add(value)
     return value
 def source_audit(entry, kind, identifier, uncertainties):
-    if not entry.get("source_ref"):
+    reference = entry.get("source_ref")
+    if reference is not None and not isinstance(reference, str):
+        raise PlanError(kind + " source_ref must be a string or null")
+    if not reference:
         uncertainties.append({"kind": "missing_source_ref", "owner_kind": kind, "owner_id": identifier})
 def cap_add(target, value, coverage, omitted_key):
     if len(target) < MAX_REPRESENTATIVES: target.append(value)
@@ -392,6 +421,7 @@ def cost_value(items, base_env):
         entry = {"item_id": item["item_id"], "category": category, "currency": currency,
                  "quantity_unit": item["quantity_unit"], "price_unit": item["price_unit"],
                  "recurrence": item["recurrence"], "fixedness": item["fixedness"],
+                 "source_ref": item["source_ref"],
                  "events": values["events"], "quantity": values["quantity"], "unit_price": values["unit_price"],
                  "fixed_cost": values["fixed_cost"], "total": total, "unknown_fields": unknown_fields,
                  "issues": item_issues, "formula": "events * quantity * unit_price + fixed_cost"}
@@ -525,7 +555,8 @@ def _audit_plan(raw, index, maximum):
         source_audit(raw_item, "cost_item", item_id, uncertainties)
         item = {"item_id": item_id, "category": category, "currency": currency,
                 "quantity_unit": quantity_unit, "price_unit": price_unit,
-                "recurrence": raw_item.get("recurrence", "recurring"), "fixedness": raw_item.get("fixedness")}
+                "recurrence": raw_item.get("recurrence", "recurring"), "fixedness": raw_item.get("fixedness"),
+                "source_ref": raw_item.get("source_ref")}
         for field, default in (("events", Fraction(1)), ("quantity", None), ("unit_price", None), ("fixed_cost", Fraction(0))):
             item[field] = raw_item.get(field, default)
         items.append(item); result["cost_audit"]["items"].append(dict(item))

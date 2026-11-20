@@ -16,7 +16,7 @@ import re
 import sys
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.4.0"
 MISSING = object()
 
 
@@ -190,40 +190,317 @@ def apply_patch(document, operations):
     return result
 
 
-def schema_of(contract):
+DESCRIPTIVE_KEYS = {
+    "note": ("note", "always"),
+    "schema_style": ("schema_style", "always"),
+    "constraint": ("constraint", "always"),
+    "rule": ("rule", "always"),
+    "required_content": ("required_content", "always"),
+    "required_content_when_nonnull": ("required_content", "value is not null")
+}
+CONTRACT_METADATA_KEYS = ("format", "required_path", "result_file")
+
+
+def json_digest(value):
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def pointer_token(value):
+    return str(value).replace("~", "~0").replace("/", "~1")
+
+
+def map_alias(schema, alias, canonical, path, conversions):
+    if alias not in schema:
+        return
+    value = schema.pop(alias)
+    action = "mapped"
+    if canonical in schema:
+        if not equal(schema[canonical], value):
+            raise AuditError("conflicting " + alias + " and " + canonical +
+                             " at " + (path or "/"))
+        action = "matched_existing_canonical"
+    else:
+        schema[canonical] = copy.deepcopy(value)
+    conversions.append({"path": path + "/" + pointer_token(alias),
+                        "from": alias, "to": canonical, "action": action,
+                        "value": copy.deepcopy(value)})
+
+
+def extract_descriptive(schema, path, semantics):
+    for keyword, (kind, applies_when) in DESCRIPTIVE_KEYS.items():
+        if keyword not in schema:
+            continue
+        value = schema.pop(keyword)
+        semantics.append({
+            "path": path + "/" + pointer_token(keyword),
+            "keyword": keyword, "kind": kind, "value": copy.deepcopy(value),
+            "applies_when": applies_when, "mechanically_validated": False})
+
+
+def descriptor_schema(descriptor, path, conversions, semantics):
+    if not isinstance(descriptor, dict):
+        raise AuditError("field descriptor must be an object at " + path)
+    if "schema" in descriptor:
+        if not isinstance(descriptor["schema"], dict):
+            raise AuditError("descriptor schema must be an object at " + path)
+        unsupported_siblings = sorted(set(descriptor) - {"schema"} - set(DESCRIPTIVE_KEYS))
+        if unsupported_siblings:
+            raise AuditError("descriptor schema cannot be combined with sibling keys at " +
+                             path + ": " + ", ".join(unsupported_siblings))
+        descriptive_wrapper = copy.deepcopy(descriptor)
+        extract_descriptive(descriptive_wrapper, path, semantics)
+        conversions.append({"path": path + "/schema", "from": "schema",
+                            "to": "field schema", "action": "unwrapped"})
+        schema = copy.deepcopy(descriptor["schema"])
+    else:
+        schema = copy.deepcopy(descriptor)
+    map_alias(schema, "allowed_values", "enum", path, conversions)
+    map_alias(schema, "allowed", "enum", path, conversions)
+    map_alias(schema, "required_exact_value", "const", path, conversions)
+    map_alias(schema, "must_equal", "const", path, conversions)
+    extract_descriptive(schema, path, semantics)
+    return schema
+
+
+def split_required(descriptor, path, conversions):
+    if not isinstance(descriptor, dict) or "required" not in descriptor:
+        return descriptor, None
+    stripped = copy.deepcopy(descriptor)
+    required = stripped.pop("required")
+    if not isinstance(required, bool):
+        raise AuditError("field required must be a boolean at " + path + "/required")
+    conversions.append({"path": path + "/required", "from": "required",
+                        "to": "root required membership",
+                        "action": "required_field" if required else "optional_field",
+                        "value": required})
+    return stripped, required
+
+
+def extract_contract_metadata(schema, semantics):
+    for keyword in [key for key in schema if key in CONTRACT_METADATA_KEYS]:
+        value = schema.pop(keyword)
+        semantics.append({"path": "/" + pointer_token(keyword),
+                          "keyword": keyword, "kind": "contract_metadata",
+                          "value": copy.deepcopy(value),
+                          "applies_when": "contract processing",
+                          "mechanically_validated": False})
+
+
+def has_boolean_required_descriptor(contract):
+    if not isinstance(contract, dict) or not isinstance(contract.get("properties"), dict):
+        return False
+    return any(isinstance(descriptor, dict) and
+               isinstance(descriptor.get("required"), bool)
+               for descriptor in contract["properties"].values())
+
+
+def validate_required_names(required):
+    if not isinstance(required, list) or \
+            not all(isinstance(name, str) for name in required) or \
+            len(set(required)) != len(required):
+        raise AuditError("output_contract required fields must be an array of unique names")
+
+
+def adaptation(source_form, contract, schema, conversions, semantics):
+    return {
+        "adapter": "descriptive-output-contract/v1",
+        "source_form": source_form,
+        "source_contract_sha256": json_digest(contract),
+        "normalized_schema_sha256": json_digest(schema) if schema is not None else None,
+        "normalized_schema": schema,
+        "conversions": conversions,
+        "semantic_constraints": semantics,
+        "semantic_coverage": "recorded only; descriptive and conditional content requirements are not mechanically validated",
+        "unknown_keywords": "retained in normalized_schema for explicit unsupported-keyword validation errors"
+    }
+
+
+def adapt_contract(contract):
     if not isinstance(contract, dict):
-        return None
+        return None, adaptation("unsupported", contract, None, [], [])
     for key in ("json_schema", "schema"):
         if isinstance(contract.get(key), dict) and (
                 "properties" in contract[key] or "type" in contract[key]):
-            return contract[key]
+            if has_boolean_required_descriptor(contract[key]):
+                schema, inner = adapt_contract(contract[key])
+                conversions = inner["conversions"]
+                semantics = inner["semantic_constraints"]
+            else:
+                schema = copy.deepcopy(contract[key])
+                conversions = []
+                semantics = []
+            extras = {name: copy.deepcopy(value) for name, value in contract.items() if name != key}
+            extract_descriptive(extras, "", semantics)
+            for annotation in ("description", "title"):
+                if annotation not in extras:
+                    continue
+                value = extras.pop(annotation)
+                if annotation in schema:
+                    if not equal(schema[annotation], value):
+                        raise AuditError("conflicting wrapper and schema " + annotation)
+                    action = "matched_existing_canonical"
+                else:
+                    schema[annotation] = value
+                    action = "mapped"
+                conversions.append({"path": "/" + annotation,
+                                    "from": "wrapper " + annotation, "to": annotation,
+                                    "action": action, "value": copy.deepcopy(value)})
+            if extras:
+                raise AuditError("unrecognized keys alongside canonical " + key + ": " +
+                                 ", ".join(sorted(extras)))
+            return schema, adaptation("canonical_json_schema", contract, schema,
+                                      conversions, semantics)
+
+    field_keys = [key for key in ("fields", "top_level_fields", "properties") if key in contract]
+    free_requirements = "field_requirements" in contract
+    if "required_fields" in contract or \
+            any(key != "properties" for key in field_keys) or free_requirements or \
+            "additional_top_level_fields_allowed" in contract or \
+            "additional_top_level_fields" in contract or \
+            has_boolean_required_descriptor(contract):
+        if len(field_keys) > 1:
+            raise AuditError("output_contract must use only one of fields, top_level_fields, properties")
+        if free_requirements and field_keys:
+            raise AuditError("field_requirements cannot be combined with another field container")
+        field_key = field_keys[0] if field_keys else None
+        field_map = contract[field_key] if field_key else None
+        if not free_requirements and not isinstance(field_map, (dict, list)):
+            raise AuditError("descriptive output_contract requires fields or properties")
+        conversions = []
+        semantics = []
+        excluded = set(field_keys) | {"field_requirements"}
+        schema = {key: copy.deepcopy(value) for key, value in contract.items()
+                  if key not in excluded}
+        extract_descriptive(schema, "", semantics)
+        extract_contract_metadata(schema, semantics)
+        properties = {}
+        required_flags = {}
+        if free_requirements:
+            if not isinstance(contract["field_requirements"], dict):
+                raise AuditError("field_requirements must be an object of descriptive strings")
+            for name, requirement in contract["field_requirements"].items():
+                if not isinstance(name, str) or not name or name.startswith("$"):
+                    raise AuditError("invalid output_contract field name: " + repr(name))
+                if not isinstance(requirement, str):
+                    raise AuditError("field_requirements values must be descriptive strings at /field_requirements/" + pointer_token(name))
+                properties[name] = {}
+                semantics.append({"path": "/field_requirements/" + pointer_token(name),
+                                  "keyword": "field_requirements", "kind": "required_content",
+                                  "value": copy.deepcopy(requirement), "applies_when": "always",
+                                  "mechanically_validated": False})
+            required_hint = contract.get("required_fields", contract.get("required"))
+            if required_hint is not None:
+                validate_required_names(required_hint)
+                for name in required_hint:
+                    if name not in properties:
+                        properties[name] = {}
+                        conversions.append({"path": "/required_fields", "from": "required field name",
+                                            "to": "properties/" + pointer_token(name),
+                                            "action": "added_untyped_required_property", "field": name})
+            conversions.append({"path": "/field_requirements", "from": "field_requirements",
+                                "to": "properties", "action": "mapped_free_text_requirements",
+                                "field_count": len(contract["field_requirements"]),
+                                "property_count": len(properties)})
+        elif isinstance(field_map, dict):
+            field_path = "/" + field_key
+            for name, original_descriptor in field_map.items():
+                if not isinstance(name, str) or not name or name.startswith("$"):
+                    raise AuditError("invalid output_contract field name: " + repr(name))
+                path = field_path + "/" + pointer_token(name)
+                descriptor, required_flag = split_required(original_descriptor, path, conversions)
+                if required_flag is not None:
+                    required_flags[name] = required_flag
+                properties[name] = descriptor_schema(descriptor, path, conversions, semantics)
+            conversions.append({"path": field_path, "from": field_key, "to": "properties",
+                                "action": "mapped_descriptor_map",
+                                "field_count": len(properties)})
+        else:
+            field_path = "/" + field_key
+            for index, entry in enumerate(field_map):
+                path = field_path + "/" + str(index)
+                if isinstance(entry, str):
+                    name, descriptor = entry, {}
+                elif isinstance(entry, dict):
+                    identities = [entry[key] for key in ("name", "field", "key") if key in entry]
+                    if not identities or not isinstance(identities[0], str) or not identities[0] or \
+                            any(not equal(identity, identities[0]) for identity in identities[1:]):
+                        raise AuditError("field list entry needs one consistent name at " + path)
+                    name = identities[0]
+                    descriptor = {key: copy.deepcopy(value) for key, value in entry.items()
+                                  if key not in {"name", "field", "key"}}
+                else:
+                    raise AuditError("field list entry must be a string or object at " + path)
+                if name.startswith("$") or name in properties:
+                    raise AuditError("invalid or duplicate output_contract field name: " + repr(name))
+                descriptor, required_flag = split_required(descriptor, path, conversions)
+                if required_flag is not None:
+                    required_flags[name] = required_flag
+                properties[name] = descriptor_schema(descriptor, path, conversions, semantics)
+                conversions.append({"path": path, "from": "field list entry",
+                                    "to": "properties/" + pointer_token(name),
+                                    "action": "mapped_field_identity"})
+            conversions.append({"path": field_path, "from": field_key, "to": "properties",
+                                "action": "mapped_descriptor_list",
+                                "field_count": len(properties)})
+        schema.pop("properties", None)
+        schema.setdefault("type", "object")
+        schema["properties"] = properties
+        map_alias(schema, "required_fields", "required", "", conversions)
+        required = schema.get("required")
+        flagged_required = [name for name in properties if required_flags.get(name) is True]
+        if required is None:
+            schema["required"] = flagged_required if required_flags else list(properties)
+        else:
+            validate_required_names(required)
+        if required_flags and set(schema["required"]) != set(flagged_required):
+            raise AuditError("field required booleans conflict with root required array")
+        missing = [name for name in schema["required"] if name not in properties]
+        if missing:
+            raise AuditError("required fields lack descriptors: " + ", ".join(missing))
+        map_alias(schema, "additional_top_level_fields_allowed", "additionalProperties",
+                  "", conversions)
+        map_alias(schema, "additional_top_level_fields", "additionalProperties",
+                  "", conversions)
+        schema.setdefault("additionalProperties", True)
+        source_form = "named_field_requirements" if free_requirements else "descriptive_fields"
+        return schema, adaptation(source_form, contract, schema, conversions, semantics)
+
     if "properties" in contract or contract.get("type") in (
             "object", "array", "string", "number", "integer", "boolean", "null"):
         schema = copy.deepcopy(contract)
-        schema.pop("description", None)
-        schema.pop("title", None)
         if "properties" in schema:
             schema.setdefault("type", "object")
             required = schema.get("required")
             if required is not None and not isinstance(required, list):
                 raise AuditError("schema required must be an array of field names")
             schema["required"] = list(schema["properties"]) if required is None else required
-        return schema
-    field_map = contract.get("fields") if isinstance(contract.get("fields"), dict) else contract
-    if field_map and all(isinstance(value, dict) for value in field_map.values()):
+        return schema, adaptation("canonical_json_schema", contract, schema, [], [])
+
+    if contract and all(isinstance(value, dict) for value in contract.values()):
+        conversions = []
+        semantics = []
         properties = {}
-        for name, descriptor in field_map.items():
+        required_flags = {}
+        for name, original_descriptor in contract.items():
             if not isinstance(name, str) or name.startswith("$"):
-                return None
-            if "schema" in descriptor and isinstance(descriptor["schema"], dict):
-                properties[name] = descriptor["schema"]
-            else:
-                properties[name] = {key: value for key, value in descriptor.items()
-                                     if key not in {"name", "field", "key"}}
-        return {"type": "object", "properties": properties,
-                "required": list(properties),
-                "additionalProperties": contract.get("additionalProperties", True)}
-    return None
+                return None, adaptation("unsupported", contract, None, [], [])
+            path = "/" + pointer_token(name)
+            descriptor, required_flag = split_required(original_descriptor, path, conversions)
+            if required_flag is not None:
+                required_flags[name] = required_flag
+            properties[name] = descriptor_schema(descriptor, path, conversions, semantics)
+        required = [name for name in properties if required_flags.get(name) is True] \
+            if required_flags else list(properties)
+        schema = {"type": "object", "properties": properties,
+                  "required": required, "additionalProperties": True}
+        return schema, adaptation("typed_field_map", contract, schema, conversions, semantics)
+    return None, adaptation("unsupported", contract, None, [], [])
+
+
+def schema_of(contract):
+    return adapt_contract(contract)[0]
 
 
 def required_fields(contract):
@@ -265,7 +542,12 @@ def initial_value(name, schema, case_id, location="contract"):
         value = copy.deepcopy(schema["default"])
     else:
         kind = field_type(schema)
-        if kind == "object" or "properties" in schema:
+        if not schema:
+            value = None
+        elif kind == "null" or schema.get("nullable") is True or (
+                isinstance(schema.get("type"), list) and "null" in schema["type"]):
+            value = None
+        elif kind == "object" or "properties" in schema:
             properties = schema.get("properties", {})
             required = set(schema.get("required", properties.keys()))
             value = {key: initial_value(key, subschema, case_id,
@@ -273,10 +555,9 @@ def initial_value(name, schema, case_id, location="contract"):
                      for key, subschema in properties.items() if key in required}
         elif kind == "array":
             value = []
-        elif kind == "null" or schema.get("nullable") is True or (
-                isinstance(schema.get("type"), list) and "null" in schema["type"]):
-            value = None
-        elif kind == "string":
+        elif kind == "string" or (kind is None and
+                name.lower() in ("status", "run_status", "state") and
+                isinstance(schema.get("enum"), list)):
             value = ""
             if name.lower() in ("status", "run_status", "state"):
                 allowed = schema.get("enum", [])
@@ -476,17 +757,24 @@ def validate_result(case, result, explicit_fields=None):
     warnings = []
     schema = None
     fields = None
+    metadata = None
     typed = explicit_fields is not None
     if explicit_fields is not None:
         fields = explicit_fields
     elif isinstance(case, dict) and "output_contract" in case:
-        schema = schema_of(case["output_contract"])
+        schema, metadata = adapt_contract(case["output_contract"])
         fields, typed = required_fields(case["output_contract"])
     if typed and schema is None:
         schema = {"type": "object", "properties": dict(fields),
                   "required": [name for name, _ in fields]}
-    if schema:
+        metadata = adaptation("explicit_fields", dict(fields), schema, [], [])
+    if schema is not None:
         errors.extend(validation_errors(result, schema, schema))
+        if isinstance(result, dict):
+            for name, subschema in schema.get("properties", {}).items():
+                if not subschema and result.get(name, MISSING) is None:
+                    warnings.append({"path": "/" + pointer_token(name),
+                                     "message": "untyped contract field has an unknown partial placeholder"})
     elif fields is not None:
         if not isinstance(result, dict):
             errors.append({"path": "", "message": "result is not an object"})
@@ -496,16 +784,60 @@ def validate_result(case, result, explicit_fields=None):
                 if name not in result:
                     errors.append({"path": "/" + name, "message": "required field is missing"})
                 elif result[name] is None:
-                    warnings.append({"path": "/" + name, "message": "untyped contract field still has a partial placeholder"})
+                    warnings.append({"path": "/" + name, "message": "untyped contract field has an unknown partial placeholder"})
     else:
         raise AuditError("output_contract is unsupported; export its JSON Schema explicitly")
     if not isinstance(result, dict) or "case_id" not in result:
         errors.append({"path": "/case_id", "message": "case_id is missing"})
     elif not equal(result["case_id"], case["case_id"]):
         errors.append({"path": "/case_id", "message": "case_id differs from original input"})
+    if metadata and metadata["semantic_constraints"]:
+        warnings.append({"path": "", "message": str(len(metadata["semantic_constraints"])) +
+                         " descriptive contract requirements are recorded but not mechanically validated"})
     return {"tool": "contract_audit.py", "tool_version": VERSION,
-            "validation_scope": "mechanical schema, field presence, and case identity; not scientific completeness",
-            "valid": not errors, "errors": errors, "warnings": warnings}
+            "validation_scope": "mechanical schema, field presence, and case identity; descriptive semantic coverage is recorded, not scientifically validated",
+            "valid": not errors, "errors": errors, "warnings": warnings,
+            "contract_adaptation": metadata}
+
+
+def write_contract_artifacts(work_dir, report):
+    metadata = report.get("contract_adaptation")
+    if not metadata or metadata.get("normalized_schema") is None:
+        return {}
+    normalized_path = Path(work_dir) / "normalized_contract.json"
+    semantic_path = Path(work_dir) / "semantic-coverage.json"
+    atomic_json(normalized_path, metadata["normalized_schema"])
+    atomic_json(semantic_path, {
+        "schema_version": "contract-semantic-coverage/v1",
+        "tool_version": VERSION,
+        "source_contract_sha256": metadata["source_contract_sha256"],
+        "normalized_schema_sha256": metadata["normalized_schema_sha256"],
+        "status": "recorded_not_mechanically_validated",
+        "constraints": metadata["semantic_constraints"]})
+    return {"normalized_contract_path": str(normalized_path.resolve()),
+            "semantic_coverage_path": str(semantic_path.resolve())}
+
+
+def brief_validation_report(report, full_report_path, artifact_paths):
+    metadata = report.get("contract_adaptation")
+    constraints = metadata.get("semantic_constraints", []) if metadata else []
+    brief = {"tool": report["tool"], "tool_version": report["tool_version"],
+             "validation_scope": report["validation_scope"],
+             "valid": report["valid"],
+             "error_count": len(report["errors"]),
+             "errors": copy.deepcopy(report["errors"]),
+             "warning_count": len(report["warnings"]),
+             "warnings": copy.deepcopy(report["warnings"]),
+             "semantic_requirements_not_mechanically_validated": sum(
+                 not item.get("mechanically_validated", False) for item in constraints),
+             "full_contract_adaptation_present": metadata is not None,
+             "full_report_path": str(Path(full_report_path).resolve())}
+    if metadata:
+        for key in ("source_contract_sha256", "normalized_schema_sha256"):
+            if metadata.get(key) is not None:
+                brief[key] = metadata[key]
+    brief.update(artifact_paths)
+    return brief
 
 
 def field_arguments(raw):
@@ -532,6 +864,9 @@ def main(argv=None):
             sub.add_argument("--patch", required=True, help="RFC 6902 JSON Patch array file")
             sub.add_argument("--reason", required=True)
             sub.add_argument("--source-refs", default="", help="comma-separated reviewed source IDs")
+    subparsers.choices["validate"].add_argument(
+        "--format", choices=("full", "brief"), default="full",
+        help="stdout format; validation.json always retains the complete report")
     args = parser.parse_args(argv)
     try:
         case = load_json(args.case)
@@ -552,11 +887,23 @@ def main(argv=None):
             state = {"schema_version": "contract-audit-state/v1", "tool_version": VERSION,
                      "case_path": str(Path(args.case).resolve()), "case_sha256": digest(args.case),
                      "case_id": case["case_id"], "created_at": utc_now(), "changes": [],
-                     "bootstrap_mechanically_valid": report["valid"], "bootstrap_errors": report["errors"]}
+                     "bootstrap_mechanically_valid": report["valid"], "bootstrap_errors": report["errors"],
+                     "contract_adaptation": report["contract_adaptation"]}
             if args.contract:
                 state.update(contract_path=str(Path(args.contract).resolve()),
-                             contract_sha256=digest(args.contract))
+                             contract_sha256=digest(args.contract),
+                             contract_provenance={"kind": "external",
+                                 "path": str(Path(args.contract).resolve()),
+                                 "sha256": digest(args.contract)})
+            elif contract is not None:
+                state.update(contract_pointer="/output_contract",
+                             contract_sha256=json_digest(contract),
+                             contract_provenance={"kind": "embedded",
+                                 "case_path": str(Path(args.case).resolve()),
+                                 "pointer": "/output_contract",
+                                 "sha256": json_digest(contract)})
             atomic_json(result_path, result)
+            write_contract_artifacts(work_dir, report)
             atomic_json(state_path, state)
             atomic_json(work_dir / "validation.json", report)
             print(json.dumps({"result": str(result_path), "state": str(state_path),
@@ -568,6 +915,12 @@ def main(argv=None):
             if state.get("case_sha256") != digest(args.case):
                 raise AuditError("case input changed since bootstrap; refusing to mix versions")
             saved_contract = state.get("contract_path")
+            provenance = state.get("contract_provenance", {})
+            if not args.contract and provenance.get("kind") == "embedded" and (
+                    "output_contract" not in case or
+                    json_digest(case["output_contract"]) != provenance.get("sha256") or
+                    json_digest(case["output_contract"]) != state.get("contract_sha256")):
+                raise AuditError("embedded output_contract differs from bootstrap; refusing to mix versions")
             if args.contract:
                 if str(Path(args.contract).resolve()) != saved_contract or \
                         digest(args.contract) != state.get("contract_sha256"):
@@ -580,8 +933,14 @@ def main(argv=None):
         validate_case = dict(case, output_contract=contract) if contract is not None else case
         if args.command == "validate":
             report = validate_result(validate_case, result, fields)
-            atomic_json(work_dir / "validation.json", report)
-            print(json.dumps(report, ensure_ascii=False, indent=2))
+            artifact_paths = write_contract_artifacts(work_dir, report)
+            full_report_path = work_dir / "validation.json"
+            atomic_json(full_report_path, report)
+            if args.format == "brief":
+                brief = brief_validation_report(report, full_report_path, artifact_paths)
+                print(json.dumps(brief, ensure_ascii=False, separators=(",", ":")))
+            else:
+                print(json.dumps(report, ensure_ascii=False, indent=2))
             return 0 if report["valid"] else 1
         if state is None:
             raise AuditError("patch requires the checkpoint from bootstrap in --work-dir")
@@ -601,6 +960,7 @@ def main(argv=None):
         updated = apply_patch(result, patch_document)
         report = validate_result(validate_case, updated, fields)
         if not report["valid"]:
+            write_contract_artifacts(work_dir, report)
             atomic_json(work_dir / "validation.json", report)
             print(json.dumps(report, ensure_ascii=False, indent=2))
             return 1
@@ -618,6 +978,8 @@ def main(argv=None):
                 [part.strip() for part in args.source_refs.split(",") if part.strip()]),
             "patch": patch_document, "before_result_sha256": before_hash,
             "after_result_sha256": after_hash})
+        state["contract_adaptation"] = report["contract_adaptation"]
+        write_contract_artifacts(work_dir, report)
         atomic_json(state_path, state)
         atomic_json(work_dir / "validation.json", report)
         print(json.dumps({"result": str(result_path), "valid": True,
